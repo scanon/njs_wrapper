@@ -1,8 +1,6 @@
 package us.kbase.common.executionengine;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.OutputStream;
+import java.io.*;
 import java.net.MalformedURLException;
 import java.net.SocketException;
 import java.net.URL;
@@ -23,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 
 import javax.servlet.http.HttpServletResponse;
 
+import org.apache.commons.io.FileUtils;
 import org.eclipse.jetty.util.log.Log;
 import org.eclipse.jetty.util.log.Logger;
 import org.joda.time.DateTime;
@@ -33,8 +32,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 
+import us.kbase.auth.AuthException;
 import us.kbase.auth.AuthToken;
-import us.kbase.auth.TokenFormatException;
+import us.kbase.auth.ConfigurableAuthService;
 import us.kbase.common.executionengine.CallbackServerConfigBuilder.CallbackServerConfig;
 import us.kbase.common.service.JacksonTupleModule;
 import us.kbase.common.service.JsonClientException;
@@ -50,39 +50,42 @@ import us.kbase.workspace.SubAction;
 
 public abstract class CallbackServer extends JsonServerServlet {
     //TODO NJS_SDK move to common repo
-    
+
     // should probably go in java_common or make a common repo for shared
     // NJSW & KB_SDK code, since they're tightly coupled
     private static final long serialVersionUID = 1L;
-    
+
     private static final int MAX_JOBS = 10;
     private static volatile int currentJobs = 0;
-    
+
     private final AuthToken token;
     private final CallbackServerConfig config;
+
     private ProvenanceAction prov = new ProvenanceAction();
-    
+
     private final static DateTimeFormatter DATE_FORMATTER =
             DateTimeFormat.forPattern("yyyy-MM-dd'T'HH:mm:ssZ").withZoneUTC();
     // IMPORTANT: don't access outside synchronized block
     private final Map<String, ModuleRunVersion> vers =
             Collections.synchronizedMap(
                     new LinkedHashMap<String, ModuleRunVersion>());
-    
+
     private final ExecutorService executor = Executors.newCachedThreadPool();
-    
+
     private final Map<UUID, FutureTask<Map<String, Object>>> runningJobs =
             new HashMap<UUID, FutureTask<Map<String, Object>>>();
-    
+
     private final Cache<UUID, FutureTask<Map<String, Object>>> resultsCache =
             CacheBuilder.newBuilder()
                 .maximumSize(1000)
                 .expireAfterWrite(10, TimeUnit.MINUTES)
                 .build();
-    
+
     private final Object getRunnerLock = new Object();
     private final Object removeJobLock = new Object();
-    
+
+    final File log;
+
     public CallbackServer(
             final AuthToken token,
             final CallbackServerConfig config,
@@ -90,6 +93,7 @@ public abstract class CallbackServer extends JsonServerServlet {
             final List<UObject> methodParameters,
             final List<String> inputWorkspaceObjects) {
         super("CallbackServer");
+        this.log = new File(System.currentTimeMillis() + ".isCheck.log");
         this.token = token;
         this.config = config;
         vers.put(runver.getModuleMethod().getModule(), runver);
@@ -108,7 +112,35 @@ public abstract class CallbackServer extends JsonServerServlet {
          * cache for jobs that are done but haven't been checked by the user
          */
     }
-    
+
+    @Override
+    public void startupFailed() {
+        /* This is a hack to avoid startup failures when the auth service isn't contactable.
+         * Since the callback server currently never contacts the auth service, and startupFailed()
+         * is only called when the auth client setup fails, it's safe to ignore. The callback
+         * server needs to be reworked to properly authenticate tokens in the longterm, see
+         * https://kbase-jira.atlassian.net/browse/TASK-881
+         */
+    }
+
+    @Override
+    protected ConfigurableAuthService getAuth(final Map<String, String> config) {
+        /* see comments for startupFailed() above. Auth isn't needed, so we can skip trying to
+         * contact the auth server.
+         */
+        return null;
+    }
+
+    @Override
+    protected AuthToken validateToken(String tokenString) throws AuthException,
+            IOException {
+        String origTokenString = token.getToken();
+        if (tokenString.equals(origTokenString)) {
+            return token;
+        }
+        return new AuthToken(tokenString, "<unknown>");
+    }
+
     protected void resetProvenanceAndMethods(final ProvenanceAction newProv) {
         if (newProv == null) {
             throw new NullPointerException("Provenance cannot be null");
@@ -118,7 +150,7 @@ public abstract class CallbackServer extends JsonServerServlet {
             prov = newProv;
         }
     }
-    
+
     @JsonServerMethod(rpc = "CallbackServer.get_provenance")
     public List<ProvenanceAction> getProvenance()
             throws IOException, JsonClientException {
@@ -131,7 +163,7 @@ public abstract class CallbackServer extends JsonServerServlet {
            sas.add(new SubAction()
                .withCodeUrl(mrv.getGitURL().toExternalForm())
                .withCommit(mrv.getGitHash())
-               .withName(mrv.getModuleMethod().getModuleDotMethod())
+               .withName(mrv.getModuleMethod().getModule())
                .withVer(mrv.getVersionAndRelease()));
         }
         return new LinkedList<ProvenanceAction>(Arrays.asList(
@@ -146,7 +178,7 @@ public abstract class CallbackServer extends JsonServerServlet {
                     .withServiceVer(prov.getServiceVer())
                  ));
     }
-    
+
     @JsonServerMethod(rpc = "CallbackServer.status")
     public UObject status() throws IOException, JsonClientException {
         Map<String, Object> data = new LinkedHashMap<String, Object>();
@@ -154,12 +186,12 @@ public abstract class CallbackServer extends JsonServerServlet {
         return new UObject(data);
     }
 
-    protected static void cbLog(String log) {
-        System.out.println(String.format("%.2f - CallbackServer: %s",
-                (System.currentTimeMillis() / 1000.0), log));
+    protected void cbLog(String log) {
+        config.getLogger().logNextLine(String.format("%.2f - CallbackServer: %s",
+                (System.currentTimeMillis() / 1000.0), log), false);
     }
-    
-    protected void processRpcCall(RpcCallData rpcCallData, String token, JsonServerSyslog.RpcInfo info, 
+
+    protected void processRpcCall(RpcCallData rpcCallData, String token, JsonServerSyslog.RpcInfo info,
             String requestHeaderXForwardedFor, ResponseStatusSetter response, OutputStream output,
             boolean commandLine) {
         if (rpcCallData.getMethod().startsWith("CallbackServer.")) {
@@ -168,9 +200,12 @@ public abstract class CallbackServer extends JsonServerServlet {
             String errorMessage = null;
             Map<String, Object> jsonRpcResponse = null;
             try {
-                jsonRpcResponse = handleCall(rpcCallData);
+                jsonRpcResponse = handleCall(rpcCallData, token);
             } catch (Exception ex) {
-                ex.printStackTrace();
+                StringWriter sw = new StringWriter();
+                PrintWriter pw = new PrintWriter(sw);
+                ex.printStackTrace(pw);
+                cbLog(sw.toString());
                 errorMessage = ex.getMessage();
             }
             try {
@@ -200,15 +235,30 @@ public abstract class CallbackServer extends JsonServerServlet {
     }
 
     private Map<String, Object> handleCall(
-            final RpcCallData rpcCallData) throws IOException,
-            JsonClientException, InterruptedException, TokenFormatException {
+            final RpcCallData rpcCallData, String callTokenText) throws IOException,
+            JsonClientException, InterruptedException {
 
         final ModuleMethod modmeth = new ModuleMethod(
                 rpcCallData.getMethod());
         final Map<String, Object> jsonRpcResponse;
-        
+
+
         if (modmeth.isCheck()) {
             jsonRpcResponse = runCheck(rpcCallData);
+            String time = System.currentTimeMillis() + "";
+            String id = rpcCallData.getId().toString();
+
+            String logString = String.format("%s|id:%s|context|:%s\n", time, id, rpcCallData.getContext().toString());
+            FileUtils.writeStringToFile(this.log, logString, true);
+
+            logString = String.format("%s|id:%s|method|:%s\n", time, id, rpcCallData.getMethod().toString());
+            FileUtils.writeStringToFile(this.log, logString, true);
+
+            logString = String.format("%s|id:%s|params|:%s\n", time, id, rpcCallData.getParams().toString());
+            FileUtils.writeStringToFile(this.log, logString, true);
+
+            logString = String.format("%s|id:%s|response:%s\n", time, id, jsonRpcResponse.toString().toString());
+            FileUtils.writeStringToFile(this.log, logString, true);
         } else {
             final UUID jobId = UUID.randomUUID();
             cbLog(String.format("Subjob method: %s JobID: %s",
@@ -219,14 +269,16 @@ public abstract class CallbackServer extends JsonServerServlet {
             // update method name to get rid of suffixes
             rpcCallData.setMethod(modmeth.getModuleDotMethod());
             incrementJobCount();
+            AuthToken callToken = callTokenText == null ? null :
+                new AuthToken(callTokenText, "<unknown>");
             if (modmeth.isStandard()) {
                 try {
-                    jsonRpcResponse = runner.run(rpcCallData);
+                    jsonRpcResponse = runner.run(rpcCallData, callToken);
                 } finally {
                     decrementJobCount();
                 }
             } else {
-                startJob(rpcCallData, jobId, runner);
+                startJob(rpcCallData, jobId, runner, callToken);
                 jsonRpcResponse = new HashMap<String, Object>();
                 jsonRpcResponse.put("version", "1.1");
                 jsonRpcResponse.put("id", rpcCallData.getId());
@@ -237,26 +289,26 @@ public abstract class CallbackServer extends JsonServerServlet {
     }
 
     private void startJob(final RpcCallData rpcCallData, final UUID jobId,
-            final SubsequentCallRunner runner) throws IOException {
+            final SubsequentCallRunner runner, AuthToken callToken) throws IOException {
         FutureTask<Map<String, Object>> task = null;
         try {
             /* need to make a copy of the RPC data because it contains
              * a list of UObjects which each contain a reference to a
              * JsonTokenStream. The JTS is closed by the superclass
              * when this call returns and can't be read when the subjob
-             * runner starts. 
+             * runner starts.
              * This implementation assumes the UObjects are reasonably
              * small. If they're really big need to do something
              * smarter, or check the size before serializing them and
              * throw an error.
-             * 
+             *
              * Winds up with 3 copies of the object - the UObject,
              * the ByteArrayOutputStream, and the new byte array
              * returned by toByteArray().
-             * 
+             *
              * At least this doesn't instantiate the objects which
              * uses 5-20x memory.
-             * 
+             *
              * Possible improvement:
              * 1) Add constructor to UObject that allows specifying
              * the size (currently runs through the object).
@@ -265,7 +317,7 @@ public abstract class CallbackServer extends JsonServerServlet {
              * then just return the array.
              * 3) Also gets rid of BAOS synchronization which isn't
              * needed here.
-             * 
+             *
              */
             final List<UObject> newobjs = new LinkedList<UObject>();
             for (final UObject uo: rpcCallData.getParams()) {
@@ -280,7 +332,7 @@ public abstract class CallbackServer extends JsonServerServlet {
             rpcCallData.setParams(newobjs);
             task = new FutureTask<Map<String, Object>>(
                     new SubsequentCallRunnerRunner(
-                            runner, rpcCallData));
+                            runner, rpcCallData, callToken));
             executor.execute(task);
             runningJobs.put(jobId, task);
         } catch (IOException | RuntimeException | Error e) {
@@ -300,7 +352,7 @@ public abstract class CallbackServer extends JsonServerServlet {
         }
         currentJobs++;
     }
-    
+
     private synchronized void decrementJobCount() {
         //decrement is not atomic
         currentJobs--;
@@ -308,7 +360,7 @@ public abstract class CallbackServer extends JsonServerServlet {
 
     private Map<String, Object> runCheck(final RpcCallData rpcCallData)
             throws InterruptedException, IOException {
-        
+
         if (rpcCallData.getParams().size() != 1) {
             throw new IllegalArgumentException(
                     "Check methods take exactly one argument");
@@ -351,7 +403,7 @@ public abstract class CallbackServer extends JsonServerServlet {
                         " or it has expired from the cache");
             }
             resp = getResults(task);
-            
+
         } else {
             resp = new HashMap<String, Object>();
             resp.put("version", "1.1");
@@ -363,7 +415,11 @@ public abstract class CallbackServer extends JsonServerServlet {
             result.put("result", resp.get("result"));
         }
         final Map<String, Object> copy = new HashMap<String, Object>(resp);
-        copy.put("result", Arrays.asList(result));
+        // Adding this check makes java client happy because it doesn't like
+        // to see both "error" and "result" blocks in JSON-RPC response.
+        if (!copy.containsKey("error")) {
+            copy.put("result", Arrays.asList(result));
+        }
         return copy;
     }
 
@@ -391,25 +447,28 @@ public abstract class CallbackServer extends JsonServerServlet {
 
         private final SubsequentCallRunner scr;
         private final RpcCallData rpc;
+        private final AuthToken callToken;
 
         public SubsequentCallRunnerRunner(
                 final SubsequentCallRunner scr,
-                final RpcCallData rpcData) {
+                final RpcCallData rpcData,
+                final AuthToken callToken) {
             this.scr = scr;
             this.rpc = rpcData;
+            this.callToken = callToken;
         }
 
         @Override
         public Map<String, Object> call() throws Exception {
-            return scr.run(rpc);
+            return scr.run(rpc, callToken);
         }
     }
-    
+
     private SubsequentCallRunner getJobRunner(
             final UUID jobId,
             final RpcContext rpcContext,
             final ModuleMethod modmeth)
-            throws IOException, JsonClientException, TokenFormatException  {
+            throws IOException, JsonClientException  {
         final SubsequentCallRunner runner;
         synchronized (getRunnerLock) {
             final String serviceVer;
@@ -428,7 +487,7 @@ public abstract class CallbackServer extends JsonServerServlet {
                                 v.getGitHash(), v.getVersion(),
                                 v.getRelease()));
             } else {
-                serviceVer = rpcContext == null ? null : 
+                serviceVer = rpcContext == null ? null :
                     (String)rpcContext.getAdditionalProperties()
                         .get("service_ver");
             }
@@ -436,7 +495,16 @@ public abstract class CallbackServer extends JsonServerServlet {
             runner = createJobRunner(token, config, jobId, modmeth,
                     serviceVer);
             if (!vers.containsKey(modmeth.getModule())) {
-                vers.put(modmeth.getModule(), runner.getModuleRunVersion());
+                final ModuleRunVersion v = runner.getModuleRunVersion();
+                cbLog(String.format("Running module %s:\n" +
+                        "url: %s\n" +
+                        "commit: %s\n" +
+                        "version: %s\n" +
+                        "release: %s\n",
+                        modmeth.getModule(), v.getGitURL(),
+                        v.getGitHash(), v.getVersion(),
+                        v.getRelease()));
+                vers.put(modmeth.getModule(), v);
             }
         }
         return runner;
@@ -448,8 +516,8 @@ public abstract class CallbackServer extends JsonServerServlet {
             final UUID jobId,
             final ModuleMethod modmeth,
             final String serviceVer)
-            throws IOException, JsonClientException, TokenFormatException;
-    
+            throws IOException, JsonClientException;
+
     @Override
     public void destroy() {
         cbLog("Shutting down executor service");
@@ -458,19 +526,28 @@ public abstract class CallbackServer extends JsonServerServlet {
             cbLog(String.format("Failed to stop %s tasks", failed.size()));
         }
     }
-    
+
     public static URL getCallbackUrl(int callbackPort)
             throws SocketException {
+        return getCallbackUrl(callbackPort, null);
+    }
+
+    public static URL getCallbackUrl(int callbackPort, String[] networkInterfaces)
+            throws SocketException {
+        if (networkInterfaces == null || networkInterfaces.length == 0) {
+            networkInterfaces = new String[] {"docker0", "vboxnet0", "vboxnet1",
+                    "VirtualBox Host-Only Ethernet Adapter", "en0"};
+        }
         final List<String> hostIps = NetUtils.findNetworkAddresses(
-                "docker0", "vboxnet0", "vboxnet1");
+                networkInterfaces);
         final String hostIp;
         if (hostIps.isEmpty()) {
             return null;
         } else {
             hostIp = hostIps.get(0);
             if (hostIps.size() > 1) {
-                cbLog("WARNING! Several Docker host IP addresses " +
-                        "detected, used first:  " + hostIp);
+                System.out.println("WARNING! Several Docker host IP " +
+                        "addresses detected, used first:  " + hostIp);
             }
         }
         try {
@@ -520,35 +597,35 @@ public abstract class CallbackServer extends JsonServerServlet {
     private static class UnclosableOutputStream extends OutputStream {
         OutputStream inner;
         boolean isClosed = false;
-        
+
         public UnclosableOutputStream(OutputStream inner) {
             this.inner = inner;
         }
-        
+
         @Override
         public void write(int b) throws IOException {
             if (isClosed)
                 return;
             inner.write(b);
         }
-        
+
         @Override
         public void close() throws IOException {
             isClosed = true;
         }
-        
+
         @Override
         public void flush() throws IOException {
             inner.flush();
         }
-        
+
         @Override
         public void write(byte[] b) throws IOException {
             if (isClosed)
                 return;
             inner.write(b);
         }
-        
+
         @Override
         public void write(byte[] b, int off, int len) throws IOException {
             if (isClosed)
@@ -556,12 +633,12 @@ public abstract class CallbackServer extends JsonServerServlet {
             inner.write(b, off, len);
         }
     }
-    
+
     public static class CallbackRunner implements Runnable {
 
         private final CallbackServer server;
         private final int port;
-        
+
         public CallbackRunner(CallbackServer server, int port) {
             super();
             this.server = server;
